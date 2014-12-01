@@ -408,7 +408,7 @@ class DockerManager:
                 if len(parts) == 2:
                     self.volumes[parts[1]] = {}
                     self.binds[parts[0]] = parts[1]
-                # with bind mode 
+                # with bind mode
                 elif len(parts) == 3:
                     if parts[2] not in ['ro', 'rw']:
                         self.module.fail_json(msg='bind mode needs to either be "ro" or "rw"')
@@ -742,8 +742,8 @@ def main():
             tty             = dict(default=False, type='bool'),
             lxc_conf        = dict(default=None, type='list'),
             name            = dict(default=None),
-            net             = dict(default=None)
-        )
+        ),
+        supports_check_mode = True
     )
 
     check_dependencies(module)
@@ -764,6 +764,7 @@ def main():
         running_count = len(running_containers)
         delta = count - running_count
         deployed_containers = manager.get_deployed_containers()
+        deployed_count = len(deployed_containers)
         facts = None
         failed = False
         changed = False
@@ -783,36 +784,51 @@ def main():
                 # the named container is running, but with a
                 # different image or tag, so we stop it first
                 if existing_container and existing_container.get('Config', dict()).get('Image') != image:
-                    manager.stop_containers([existing_container])
-                    manager.remove_containers([existing_container])
-                    running_containers = manager.get_running_containers()
-                    deployed_containers = manager.get_deployed_containers()
-                    existing_container = None
+                    if not module.check_mode:
+                        manager.stop_containers([existing_container])
+                        manager.remove_containers([existing_container])
+                        running_containers = manager.get_running_containers()
+                        deployed_containers = manager.get_deployed_containers()
+                        existing_container = None
+                    else:
+                        module.exit_json(changed=True, msg='container image URL has changed, starting a new')
 
                 # if the container isn't running (or if we stopped the
                 # old version above), create and (maybe) start it up now
                 if not existing_container:
-                    containers = manager.create_containers(1)
-                    if state == "present": # otherwise it get (re)started later anyways..
-                        manager.start_containers(containers)
-                        running_containers = manager.get_running_containers()
-                    deployed_containers = manager.get_deployed_containers()
+                    if not module.check_mode:
+                        containers = manager.create_containers(1)
+                        if state == "present": # otherwise it get (re)started later anyways..
+                            manager.start_containers(containers)
+                            running_containers = manager.get_running_containers()
+                        deployed_containers = manager.get_deployed_containers()
+                    else:
+                        module.exit_json(changed=True, msg='existing container not found starting')
 
             if state == "running":
                 # make sure a container with `name` is running
                 if name and "/" + name not in map(lambda x: x.get('Name'), running_containers):
-                    manager.start_containers(deployed_containers)
+                    if module.check_mode:
+                        module.exit_json(changed=True, msg=('running %s container' % name))
+                    else:
+                        manager.start_containers(deployed_containers)
 
                 # start more containers if we don't have enough
                 elif delta > 0:
-                    containers = manager.create_containers(delta)
-                    manager.start_containers(containers)
+                    if module.check_mode:
+                        module.exit_json(changed=True, msg=('start %d containers' % delta))
+                    else:
+                        containers = manager.create_containers(delta)
+                        manager.start_containers(containers)
 
                 # stop containers if we have too many
                 elif delta < 0:
-                    containers_to_stop = running_containers[0:abs(delta)]
-                    containers = manager.stop_containers(containers_to_stop)
-                    manager.remove_containers(containers_to_stop)
+                    if not module.check_mode:
+                        containers_to_stop = running_containers[0:abs(delta)]
+                        containers = manager.stop_containers(containers_to_stop)
+                        manager.remove_containers(containers_to_stop)
+                    else:
+                        module.exit_json(changed=True, msg=('removing %d containers' % delta))
 
                 facts = manager.get_running_containers()
             else:
@@ -820,27 +836,41 @@ def main():
 
         # stop and remove containers
         elif state == "absent":
-            facts = manager.stop_containers(deployed_containers)
-            manager.remove_containers(deployed_containers)
+            if not module.check_mode:
+                facts = manager.stop_containers(deployed_containers)
+                manager.remove_containers(deployed_containers)
+            else:
+                module.exit_json(changed=(deployed_count > 0), msg=('removing %d containers' % deployed_count))
 
         # stop containers
         elif state == "stopped":
-            facts = manager.stop_containers(running_containers)
+            if not module.check_mode:
+                facts = manager.stop_containers(running_containers)
+            else:
+                module.exit_json(changed=(running_count > 0), msg=('stopped %d containers' % running_count))
 
         # kill containers
         elif state == "killed":
-            manager.kill_containers(running_containers)
+            if not module.check_mode:
+                manager.kill_containers(running_containers)
+            else:
+                module.exit_json(changed=(running_count > 0), msg=('killed %d containers' % running_count))
 
         # restart containers
         elif state == "restarted":
-            manager.restart_containers(running_containers)
-            facts = manager.get_inspect_containers(running_containers)
+            if not module.check_mode:
+                manager.restart_containers(running_containers)
+                facts = manager.get_inspect_containers(running_containers)
+            else:
+                module.exit_json(changed=(running_count > 0), msg=('restarting %d containers' % running_count))
 
-        msg = "%s container(s) running image %s with command %s" % \
-                (manager.get_summary_counters_msg(), module.params.get('image'), module.params.get('command'))
-        changed = manager.has_changed()
-
-        module.exit_json(failed=failed, changed=changed, msg=msg, ansible_facts=_ansible_facts(facts))
+        if not module.check_mode:
+            msg = "%s container(s) running image %s with command %s" % \
+                    (manager.get_summary_counters_msg(), module.params.get('image'), module.params.get('command'))
+            changed = manager.has_changed()
+            module.exit_json(failed=failed, changed=changed, msg=msg, ansible_facts=_ansible_facts(facts))
+        else:
+            module.exit_json(changed=False)
 
     except DockerAPIError, e:
         changed = manager.has_changed()
